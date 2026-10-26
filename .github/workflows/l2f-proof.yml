@@ -1,0 +1,115 @@
+name: l2f main-process proof (TEMPORARY)
+
+# TEMPORARY proof workflow (pain5 l2f, #138086) — never merges. Measures the
+# Electron MAIN process during tool-heavy turns on a real Windows runner,
+# head vs base (coding-status.ts from the parent commit).
+
+on:
+  push:
+    branches: ['wine2e-desktop/pain5-l2f-proof']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: l2f main-process stall probe (Windows)
+    runs-on: blacksmith-32vcpu-windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        with:
+          fetch-depth: 3
+
+      - name: Prepare locked Desktop build and test toolchain
+        id: pm
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          extras: '[]'
+          test-environment: 'true'
+
+      - uses: ./.github/actions/retry
+        with:
+          command: npm ci
+
+      - name: Prepare locked Electron runtime
+        shell: bash
+        timeout-minutes: 10
+        run: node scripts/build/electron-runtime.mjs --source .
+
+      - name: Build (head)
+        working-directory: apps/desktop
+        shell: bash
+        timeout-minutes: 15
+        run: npm run build
+
+      - name: Probe head
+        working-directory: apps/desktop
+        shell: bash
+        timeout-minutes: 20
+        continue-on-error: true
+        run: npx playwright test -c e2e/core/playwright.config.ts l2f-mainproc-probe --trace=off --reporter=list
+        env:
+          CI: 'true'
+          HERMES_E2E_PYTHON: ${{ steps.pm.outputs.python-path }}
+          L2F_OUT: ${{ github.workspace }}/l2f-out
+          L2F_TAG: win-head
+          L2F_PY: python
+          L2F_TRACE: '1'
+          L2F_STEPS: '12'
+          L2F_PAR: '6'
+          L2F_SESSIONS: '3'
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+          ANTHROPIC_API_KEY: ''
+
+      - name: Swap coding-status.ts to base and rebuild
+        working-directory: apps/desktop
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          git show HEAD~2:apps/desktop/src/store/coding-status.ts > src/store/coding-status.ts
+          git diff --stat
+          npm run build
+
+      - name: Probe base
+        working-directory: apps/desktop
+        shell: bash
+        timeout-minutes: 20
+        continue-on-error: true
+        run: npx playwright test -c e2e/core/playwright.config.ts l2f-mainproc-probe --trace=off --reporter=list
+        env:
+          CI: 'true'
+          HERMES_E2E_PYTHON: ${{ steps.pm.outputs.python-path }}
+          L2F_OUT: ${{ github.workspace }}/l2f-out
+          L2F_TAG: win-base
+          L2F_PY: python
+          L2F_TRACE: '1'
+          L2F_STEPS: '12'
+          L2F_PAR: '6'
+          L2F_SESSIONS: '3'
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+          ANTHROPIC_API_KEY: ''
+
+      - name: Summarise
+        if: always()
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          for f in l2f-out/stall-*.json; do echo "== $f"; cat "$f"; echo; done
+          python apps/desktop/e2e/core/l2f_trace_tasks.py l2f-out/trace-win-head.json l2f-out/trace-win-base.json || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: l2f-proof-${{ github.run_attempt }}
+          path: |
+            l2f-out
+            apps/desktop/test-results/core
+          retention-days: 7
+          if-no-files-found: ignore
