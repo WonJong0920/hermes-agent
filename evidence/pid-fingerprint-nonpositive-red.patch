@@ -1,0 +1,57 @@
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index e25346e58d..780e6fae25 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -391,21 +391,21 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
+
+
+ def _pid_recycled(pid: Optional[int], started_at) -> bool:
+-    """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
+-    longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
+-    recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
+-    boot witness was added) compares the start time only."""
++    """True when a live ``pid`` is NOT the process fingerprinted at spawn (or it is unreadable): signalling
++    it would hit a stranger. ``None`` = legacy row, never recycled; UNVERIFIED is always foreign; an int
++    (pre boot witness) compares the start time only. ``"<epoch>|<start>"``: exact epoch, start within the
++    2 s liveness tolerance (pre-#140967 fingerprints read the same process ~1 s off either way)."""
+     if started_at is None or not pid:
+         return False
+     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
+         return True
+-    if isinstance(started_at, str) and "|" in started_at:
+-        return _process_fingerprint(int(pid)) != started_at
+-    from gateway.status import _start_times_agree, get_process_start_time
+-    current = get_process_start_time(int(pid))
+-    if current is None:
+-        return True
++    from gateway.status import _start_times_agree, get_process_start_time, start_time_fingerprints_match
++    current = get_process_start_time(int(pid))  # None -> TypeError below -> recycled
+     try:
++        if isinstance(started_at, str) and "|" in started_at:
++            from gateway.drain_control import current_instantiation_epoch
++            epoch, start = started_at.rsplit("|", 1)
++            return epoch != current_instantiation_epoch() or not start_time_fingerprints_match(start, current)
+         return not _start_times_agree(current, started_at)
+     except (TypeError, ValueError):
+         return True
+diff --git a/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py b/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
+index 28b4778bf4..9c89949255 100644
+--- a/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
++++ b/tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
+@@ -110,6 +110,16 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
+     assert kbd._process_fingerprint(os.getpid()) == live_fingerprint
+
+
++@pytest.mark.parametrize(("recorded_start", "current_start"),
++                         [(0, 100), (-50, 100), (100, 0), (100, -50)])
++def test_non_positive_composite_start_time_is_foreign(monkeypatch, recorded_start, current_start):
++    from gateway import drain_control, status
++    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "boot:1")
++    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: current_start)
++    live_epoch = "boot:1"
++    assert kbd._pid_recycled(os.getpid(), f"{live_epoch}|{recorded_start}") is True
++
++
+ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeypatch):
+     """Fingerprint capture fails for a new spawn: the row is NOT a legacy NULL row. A live PID under
+     it is never SIGTERM/SIGKILLed by any reclaim/timeout path, and the claim is held (not released

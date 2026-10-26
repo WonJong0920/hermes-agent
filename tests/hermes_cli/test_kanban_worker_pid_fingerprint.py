@@ -1,8 +1,8 @@
-"""A recycled worker PID is never mistaken for our worker.
+"""Worker PID decisions require a bounded spawn-fingerprint match.
 
 ``tasks.worker_pid`` survives a reboot; the number can then belong to an unrelated process. Every
 liveness decision (extend/defer the claim) and every kill (SIGTERM/SIGKILL on timeout or reclaim)
-must require the spawn-time start fingerprint to match, never bare PID existence.
+therefore checks epoch identity and a bounded start-time match instead of bare PID existence.
 """
 
 import os
@@ -108,6 +108,61 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
     # within a boot, unlike the recorded epoch of a previous one).
     drain_control.current_instantiation_epoch.cache_clear()
     assert kbd._process_fingerprint(os.getpid()) == live_fingerprint
+
+
+_LIVE_EPOCH = "boot:1"
+_LIVE_START = 10_000
+
+
+@pytest.mark.parametrize("drift", [0, 100, 200, -100, -200])
+def test_same_epoch_start_time_drift_within_tolerance_is_our_worker(monkeypatch, drift):
+    """Same instantiation epoch, start time within the shared ±200 tolerance (macOS boottime drift,
+    #117505): the live PID is still our worker, so the claim is kept and it may be signalled."""
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: f"{_LIVE_EPOCH}|{_LIVE_START + drift}")
+    recorded = f"{_LIVE_EPOCH}|{_LIVE_START}"
+    assert kbd._pid_recycled(os.getpid(), recorded) is False
+    assert kbd._worker_alive(os.getpid(), recorded) is True
+
+
+@pytest.mark.parametrize("drift", [201, -201, 1_000])
+def test_same_epoch_start_time_drift_beyond_tolerance_is_foreign(monkeypatch, drift):
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: f"{_LIVE_EPOCH}|{_LIVE_START + drift}")
+    recorded = f"{_LIVE_EPOCH}|{_LIVE_START}"
+    assert kbd._pid_recycled(os.getpid(), recorded) is True
+    assert kbd._worker_alive(os.getpid(), recorded) is False
+
+
+@pytest.mark.parametrize("drift", [0, 200])
+def test_other_epoch_is_foreign_even_within_tolerance(monkeypatch, drift):
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: f"{_LIVE_EPOCH}|{_LIVE_START + drift}")
+    assert kbd._pid_recycled(os.getpid(), f"deadbeef-boot:1|{_LIVE_START}") is True
+    assert kbd._pid_recycled(os.getpid(), f"|{_LIVE_START}") is True
+
+
+def test_empty_epoch_compares_like_any_other_epoch(monkeypatch):
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: f"|{_LIVE_START + 200}")
+    assert kbd._pid_recycled(os.getpid(), f"|{_LIVE_START}") is False
+    assert kbd._pid_recycled(os.getpid(), f"|{_LIVE_START - 1}") is True
+    assert kbd._pid_recycled(os.getpid(), f"{_LIVE_EPOCH}|{_LIVE_START + 200}") is True
+
+
+@pytest.mark.parametrize("recorded", [f"{_LIVE_EPOCH}|", f"{_LIVE_EPOCH}|abc",
+                                      f"{_LIVE_EPOCH}|{_LIVE_START}|{_LIVE_START}", "|"])
+def test_malformed_composite_fingerprint_is_foreign(monkeypatch, recorded):
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: f"{_LIVE_EPOCH}|{_LIVE_START}")
+    assert kbd._pid_recycled(os.getpid(), recorded) is True
+
+
+@pytest.mark.parametrize(("recorded_start", "current_start"),
+                         [(0, 100), (-50, 100), (100, 0), (100, -50)])
+def test_non_positive_composite_start_time_is_foreign(monkeypatch, recorded_start, current_start):
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: f"{_LIVE_EPOCH}|{current_start}")
+    assert kbd._pid_recycled(os.getpid(), f"{_LIVE_EPOCH}|{recorded_start}") is True
+
+
+def test_unreadable_current_fingerprint_is_foreign(monkeypatch):
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: None)
+    assert kbd._pid_recycled(os.getpid(), f"{_LIVE_EPOCH}|{_LIVE_START}") is True
 
 
 def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeypatch):

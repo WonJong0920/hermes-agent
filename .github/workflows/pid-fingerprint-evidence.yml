@@ -1,0 +1,57 @@
+name: PID fingerprint evidence
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/kanban-pid-fingerprint-start-time-drift
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pid-fingerprint-evidence-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Focused regression and repository checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the evidence branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Prepare the locked Hermes test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '[]'
+          test-environment: 'true'
+          cache: false
+          cache-python: false
+
+      - name: Run focused PID start-time suites
+        run: |
+          scripts/run_tests.sh \
+            tests/hermes_cli/test_kanban_worker_pid_fingerprint.py \
+            tests/cron/test_owner_start_time_drift.py \
+            tests/gateway/test_owner_liveness_drift.py \
+            tests/tools/test_pgid_starttime_drift.py
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: Run repository checks
+        run: |
+          BASE=05d7b5af1c42d524762c7ffce991c1fe1aa2adb1
+          git branch -f evidence-base "$BASE"
+          "$HERMES_PYTHON" scripts/check --commit HEAD --base evidence-base
+
+      - name: Verify published patch whitespace
+        run: git diff --check 05d7b5af1c42d524762c7ffce991c1fe1aa2adb1...HEAD
+
+      - name: Check the checkout is clean
+        uses: ./.github/actions/check-clean-worktree
